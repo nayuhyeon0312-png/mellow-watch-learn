@@ -1,78 +1,362 @@
-// mellow local backend — Node.js 18+
+
+// mellow watch & learn — Node.js 18+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.SUPADATA_API_KEY;
+const SUPADATA_API_KEY = process.env.SUPADATA_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const ROOT = __dirname;
 
-async function transcript(url, lang) {
-  const endpoint = new URL('https://api.supadata.ai/v1/transcript');
-  endpoint.searchParams.set('url', url);
-  endpoint.searchParams.set('lang', lang);
-  endpoint.searchParams.set('mode', 'auto');
-  const response = await fetch(endpoint, { headers: { 'x-api-key': API_KEY } });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.details || data.message || data.error || `Transcript API error ${response.status}`);
-  if (data.jobId) {
-    for (let i = 0; i < 30; i++) {
-      await new Promise(r => setTimeout(r, 2000));
-      const poll = await fetch(`https://api.supadata.ai/v1/transcript/${encodeURIComponent(data.jobId)}`, {
-        headers: { 'x-api-key': API_KEY }
-      });
-      const job = await poll.json();
-      if (job.status === 'completed') return job.result || job;
-      if (job.status === 'failed') throw new Error(job.error || 'Transcript processing failed');
-    }
-    throw new Error('자막 생성 시간이 초과됐어요. 잠시 후 다시 시도해 주세요.');
+const cache = new Map();
+const CACHE_TIME = 6 * 60 * 60 * 1000;
+const requestCounts = new Map();
+const DAILY_LIMIT = 5;
+
+function send(res, status, data) {
+  res.writeHead(status, {
+    'Access-Control-Allow-Origin': '*',
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(JSON.stringify(data));
+}
+
+function getVideoId(value) {
+  const url = new URL(value);
+  const host = url.hostname.replace(/^www\./, '').replace(/^m\./, '');
+
+  if (host === 'youtu.be') {
+    return url.pathname.split('/').filter(Boolean)[0] || null;
   }
+
+  if (host === 'youtube.com') {
+    return url.searchParams.get('v') ||
+      (url.pathname.match(/^\/(?:embed|shorts|live)\/([^/?]+)/) || [])[1] || null;
+  }
+
+  return null;
+}
+
+async function errorMessage(response) {
+  const text = await response.text();
+  try {
+    const data = JSON.parse(text);
+    return data.details || data.message || data.error || text;
+  } catch {
+    return text || `API 오류 ${response.status}`;
+  }
+}
+
+async function getTranscript(videoUrl) {
+  const endpoint = new URL('https://api.supadata.ai/v1/transcript');
+  endpoint.searchParams.set('url', videoUrl);
+  endpoint.searchParams.set('lang', 'en');
+  endpoint.searchParams.set('mode', 'auto');
+
+  let response = await fetch(endpoint, {
+    headers: { 'x-api-key': SUPADATA_API_KEY }
+  });
+
+  if (!response.ok) {
+    throw new Error('영어 자막을 가져오지 못했어요: ' + await errorMessage(response));
+  }
+
+  let data = await response.json();
+
+  if (data.jobId) {
+    let completed = false;
+
+    for (let i = 0; i < 45; i++) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      response = await fetch(
+        'https://api.supadata.ai/v1/transcript/' + encodeURIComponent(data.jobId),
+        { headers: { 'x-api-key': SUPADATA_API_KEY } }
+      );
+
+      if (!response.ok) {
+        throw new Error('자막 작업 확인 실패: ' + await errorMessage(response));
+      }
+
+      const job = await response.json();
+
+      if (job.status === 'completed') {
+        data = job.result || job;
+        completed = true;
+        break;
+      }
+
+      if (job.status === 'failed') {
+        throw new Error(job.error || '자막 생성에 실패했어요.');
+      }
+    }
+
+    if (!completed) {
+      throw new Error('자막 생성 시간이 초과됐어요. 잠시 후 다시 시도해 주세요.');
+    }
+  }
+
   return data;
 }
-function normalize(payload) {
-  if (!Array.isArray(payload.content)) return [];
-  return payload.content.map(x => ({
-    start: Number(x.offset || 0) / 1000,
-    end: (Number(x.offset || 0) + Number(x.duration || 2500)) / 1000,
-    text: String(x.text || '')
+
+function normalize(data) {
+  if (!Array.isArray(data.content)) return [];
+
+  return data.content.map(item => {
+    const start = Number(item.offset || 0) / 1000;
+    const duration = Number(item.duration || 2500) / 1000;
+
+    return {
+      start,
+      end: start + duration,
+      en: String(item.text || '').trim()
+    };
+  }).filter(item => item.en);
+}
+
+async function translateBatch(segments) {
+  const endpoint =
+    'https://generativelanguage.googleapis.com/v1beta/models/' +
+    encodeURIComponent(GEMINI_MODEL) +
+    ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY);
+
+  const input = segments.map((item, index) => ({
+    id: index,
+    text: item.en
+  }));
+
+  const prompt =
+    'Translate each English subtitle into natural Korean. ' +
+    'Keep every item and its order. Return only a JSON array. ' +
+    'Each object must contain id and ko fields.\n\n' +
+    JSON.stringify(input);
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        responseMimeType: 'application/json'
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const message = await errorMessage(response);
+
+    if (response.status === 429) {
+      throw new Error('Gemini 무료 사용량 한도에 도달했어요. 나중에 다시 시도해 주세요.');
+    }
+
+    throw new Error('Gemini 번역 오류: ' + message);
+  }
+
+  const data = await response.json();
+  const resultText = data.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || '').join('');
+
+  if (!resultText) {
+    throw new Error('Gemini 번역 결과가 비어 있어요.');
+  }
+
+  let result;
+
+  try {
+    result = JSON.parse(resultText);
+  } catch {
+    throw new Error('번역 결과를 읽을 수 없어요.');
+  }
+
+  if (!Array.isArray(result)) {
+    throw new Error('번역 결과 형식이 올바르지 않아요.');
+  }
+
+  const translations = new Map(
+    result.map(item => [Number(item.id), String(item.ko || '')])
+  );
+
+  return segments.map((item, index) => ({
+    ...item,
+    ko: translations.get(index) || ''
   }));
 }
-function align(en, ko) {
-  return en.map((a, i) => {
-    let best = null, delta = Infinity;
-    for (const b of ko) {
-      const d = Math.abs(b.start - a.start);
-      if (d < delta) { delta = d; best = b; }
-    }
-    return { start: a.start, end: a.end, en: a.text, ko: best && delta <= 5 ? best.text : '' };
-  });
+
+async function translateAll(segments) {
+  const output = [];
+  const batchSize = 25;
+
+  for (let i = 0; i < segments.length; i += batchSize) {
+    const batch = segments.slice(i, i + batchSize);
+    const translated = await translateBatch(batch);
+    output.push(...translated);
+  }
+
+  return output;
 }
-http.createServer(async (req, res) => {
-  const headers = { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json; charset=utf-8' };
-  if (req.url.startsWith('/api/transcript')) {
-    if (!API_KEY) { res.writeHead(503, headers); return res.end(JSON.stringify({error:'서버에 SUPADATA_API_KEY가 설정되지 않았어요. README 안내를 확인해 주세요.'})); }
-    try {
-      const u = new URL(req.url, `http://${req.headers.host}`);
-      const videoUrl = u.searchParams.get('url');
-      if (!videoUrl || !/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(videoUrl)) throw new Error('올바른 유튜브 링크를 입력해 주세요.');
-      const [enData, koData] = await Promise.all([transcript(videoUrl, 'en'), transcript(videoUrl, 'ko')]);
-      const en = normalize(enData), ko = normalize(koData);
-      if (!en.length) throw new Error('영어 자막을 찾을 수 없어요.');
-      const segments = align(en, ko);
-      res.writeHead(200, headers);
-      res.end(JSON.stringify({segments, languages:{english:enData.lang||'unknown',korean:koData.lang||'unknown'}, warning:koData.lang !== 'ko' ? '한국어 자막이 제공되지 않아 번역 언어가 다를 수 있습니다.' : null}));
-    } catch (e) {
-      res.writeHead(502, headers);
-      res.end(JSON.stringify({error:e.message || '자막을 불러오지 못했어요.'}));
+
+function canRequest(ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  const old = requestCounts.get(ip);
+
+  if (!old || old.day !== today) {
+    requestCounts.set(ip, { day: today, count: 1 });
+    return true;
+  }
+
+  if (old.count >= DAILY_LIMIT) return false;
+
+  old.count++;
+  return true;
+}
+
+async function handleTranscript(req, res, requestUrl) {
+  if (!SUPADATA_API_KEY || !GEMINI_API_KEY) {
+    return send(res, 503, {
+      error: 'Render 환경 변수 SUPADATA_API_KEY와 GEMINI_API_KEY를 확인해 주세요.'
+    });
+  }
+
+  const videoUrl = requestUrl.searchParams.get('url');
+
+  if (!videoUrl) {
+    return send(res, 400, { error: '유튜브 링크를 입력해 주세요.' });
+  }
+
+  let videoId;
+
+  try {
+    videoId = getVideoId(videoUrl);
+  } catch {
+    return send(res, 400, { error: '올바른 유튜브 링크를 입력해 주세요.' });
+  }
+
+  if (!videoId) {
+    return send(res, 400, { error: '지원하지 않는 유튜브 링크예요.' });
+  }
+
+  const saved = cache.get(videoId);
+
+  if (saved && Date.now() - saved.time < CACHE_TIME) {
+    return send(res, 200, saved.data);
+  }
+
+  const ip = String(
+    req.headers['x-forwarded-for'] ||
+    req.socket.remoteAddress ||
+    'unknown'
+  ).split(',')[0].trim();
+
+  if (!canRequest(ip)) {
+    return send(res, 429, {
+      error: '오늘 신규 자막 요청 5회를 모두 사용했어요. 내일 다시 시도해 주세요.'
+    });
+  }
+
+  try {
+    const transcript = await getTranscript(videoUrl);
+    const english = normalize(transcript);
+
+    if (!english.length) {
+      throw new Error('영어 자막을 찾지 못했어요. 이 영상은 자막 생성이 지원되지 않을 수 있어요.');
     }
-    return;
+
+    const segments = await translateAll(english);
+
+    const result = {
+      segments,
+      languages: {
+        english: transcript.lang || 'en',
+        korean: 'Gemini 번역'
+      },
+      warning: null
+    };
+
+    cache.set(videoId, { time: Date.now(), data: result });
+
+    return send(res, 200, result);
+  } catch (error) {
+    console.error(error);
+    return send(res, 502, {
+      error: error.message || '자막을 불러오지 못했어요.'
+    });
   }
-  const pathname = decodeURIComponent(new URL(req.url, `http://${req.headers.host}`).pathname);
-  const file = pathname === '/' ? 'index.html' : pathname.slice(1);
-  const full = path.join(ROOT, file);
-  if (!full.startsWith(ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-    res.writeHead(404); return res.end('Not found');
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
+    });
+    return res.end();
   }
-  const type = full.endsWith('.html') ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8';
-  res.writeHead(200, {'Content-Type':type});
+
+  let url;
+
+  try {
+    url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  } catch {
+    res.writeHead(400);
+    return res.end('Bad request');
+  }
+
+  if (url.pathname === '/api/transcript' && req.method === 'GET') {
+    return handleTranscript(req, res, url);
+  }
+
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405);
+    return res.end('Method not allowed');
+  }
+
+  let pathname;
+
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    res.writeHead(400);
+    return res.end('Bad request');
+  }
+
+  const requested = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const full = path.resolve(ROOT, requested);
+
+  if (!full.startsWith(ROOT + path.sep) ||
+      !fs.existsSync(full) ||
+      fs.statSync(full).isDirectory()) {
+    res.writeHead(404);
+    return res.end('Not found');
+  }
+
+  const types = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.ico': 'image/x-icon'
+  };
+
+  const ext = path.extname(full).toLowerCase();
+
+  res.writeHead(200, {
+    'Content-Type': types[ext] || 'application/octet-stream'
+  });
+
+  if (req.method === 'HEAD') return res.end();
+
   fs.createReadStream(full).pipe(res);
-}).listen(PORT, () => console.log(`mellow running at http://localhost:${PORT}`));
+});
+
+server.listen(PORT, () => {
+  console.log(`mellow running on port ${PORT}`);
+});
