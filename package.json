@@ -1,0 +1,12 @@
+{
+  "name": "mellow-watch-learn",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bilingual YouTube subtitle learning site",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
