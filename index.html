@@ -57,7 +57,13 @@ function combine(en,ko){return en.map(a=>{let match=ko.reduce((best,b)=>Math.abs
 function loadVideo(){let url=$('urlInput').value.trim(),id=getId(url);if(!id){$('videoStatus').textContent='유튜브 링크를 확인해 주세요';return} $('videoWrap').innerHTML=`<iframe id="ytplayer" src="https://www.youtube.com/embed/${encodeURIComponent(id)}?enablejsapi=1&origin=${location.origin}" allow="autoplay; encrypted-media; picture-in-picture; web-share" allowfullscreen title="YouTube player"></iframe>`;$('videoStatus').textContent='영상 연결됨';$('captionStatus').textContent='자막을 자동으로 불러오는 중…';loadTranscript(url)}
 $('loadBtn').onclick=loadVideo;
 async function loadTranscript(url){try{const r=await fetch('/api/transcript?url='+encodeURIComponent(url));const d=await r.json();if(!r.ok)throw new Error(d.error||'자막을 가져오지 못했어요');rows=d.segments||[];if(!rows.length)throw new Error('이 영상에서 사용할 수 있는 자막을 찾지 못했어요.');render();$('captionStatus').textContent=`한·영 자막 연결 완료 · ${rows.length}개`; }catch(e){$('captionStatus').textContent='자동 자막 연결 실패';$('captions').innerHTML=`<div class="empty">${escapeHTML(e.message)}<br><br>영어/한국어 자막 파일을 직접 넣어 사용할 수도 있어요.</div>`}}
-function render(){let html=rows.map((r,i)=>`<div class="cap" data-start="${r.start}"><div class="cap-time">${stamp(r.start)}</div>${enOn?`<div class="cap-en">${wordify(r.en)}</div>`:''}${koOn?`<div class="cap-ko">${escapeHTML(r.ko||'한국어 자막을 찾지 못했어요.')}</div>`:''}</div>`).join('');$('captions').innerHTML=html||'<div class="empty">표시할 자막이 없어요.</div>';document.querySelectorAll('.word').forEach(el=>el.onclick=()=>lookup(el.dataset.word))}
+function render(){
+  $('captions').innerHTML =
+    '<div class="empty">영상을 재생하면 자막이 여기에 표시돼요.</div>';
+  document.querySelectorAll('.word').forEach(el=>{
+    el.onclick=()=>lookup(el.dataset.word);
+  });
+}
 function wordify(s){return escapeHTML(s).replace(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g,w=>`<span class="word" data-word="${w.replace(/"/g,'')}">${w}</span>`)}
 function stamp(s){let m=Math.floor(s/60),ss=Math.floor(s%60);return String(m).padStart(2,'0')+':'+String(ss).padStart(2,'0')}
 $('enToggle').onclick=()=>{enOn=!enOn;$('enToggle').classList.toggle('on',enOn);render()};$('koToggle').onclick=()=>{koOn=!koOn;$('koToggle').classList.toggle('on',koOn);render()};
