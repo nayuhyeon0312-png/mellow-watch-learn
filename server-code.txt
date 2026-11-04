@@ -1,0 +1,303 @@
+// mellow local backend — Node.js 18+
+// Uses Supadata for timestamped English transcripts and Gemini for Korean translation.
+// API keys must be configured as Render environment variables; never expose them to the browser.
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = process.env.PORT || 3000;
+const SUPADATA_API_KEY = process.env.SUPADATA_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+const ROOT = __dirname;
+
+// Small in-memory cache: repeated requests for the same video won't consume credits again
+// while this Render instance remains running.
+const transcriptCache = new Map();
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// Basic protection for this personal, public-facing demo service.
+// Free-plan provider quotas still apply independently.
+const requestCounts = new Map();
+const DAILY_REQUEST_LIMIT = 5;
+
+function sendJson(res, status, body) {
+  res.writeHead(status, {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(JSON.stringify(body));
+}
+
+function getYouTubeId(rawUrl) {
+  const u = new URL(rawUrl);
+  const host = u.hostname.toLowerCase().replace(/^www\./, '').replace(/^m\./, '');
+  if (host === 'youtu.be') return u.pathname.split('/').filter(Boolean)[0] || null;
+  if (host === 'youtube.com') {
+    return u.searchParams.get('v') ||
+      (u.pathname.match(/^\/(?:embed|shorts|live)\/([^/?]+)/) || [])[1] || null;
+  }
+  return null;
+}
+
+function normalize(payload) {
+  if (!payload || !Array.isArray(payload.content)) return [];
+  return payload.content
+    .map((item) => {
+      const startMs = Number(item.offset ?? 0);
+      const durationMs = Number(item.duration ?? 2500);
+      const text = String(item.text || '').trim();
+      return {
+        start: Math.max(0, startMs / 1000),
+        end: Math.max(0, (startMs + durationMs) / 1000),
+        en: text
+      };
+    })
+    .filter((item) => item.en);
+}
+
+async function readApiError(response) {
+  const raw = await response.text();
+  try {
+    const data = JSON.parse(raw);
+    return data.details || data.message || data.error || `API 오류 ${response.status}`;
+  } catch {
+    return raw.slice(0, 300) || `API 오류 ${response.status}`;
+  }
+}
+
+async function getSupadataTranscript(videoUrl) {
+  const endpoint = new URL('https://api.supadata.ai/v1/transcript');
+  endpoint.searchParams.set('url', videoUrl);
+  endpoint.searchParams.set('lang', 'en');
+  // auto = use existing captions first; if unavailable, try AI transcription.
+  endpoint.searchParams.set('mode', 'auto');
+
+  const response = await fetch(endpoint, {
+    headers: { 'x-api-key': SUPADATA_API_KEY }
+  });
+  if (!response.ok) {
+    const message = await readApiError(response);
+    if (response.status === 402 || /limit|credit|quota/i.test(message)) {
+      throw new Error('Supadata 무료 사용량을 다 썼거나 요청 한도에 도달했어요. 무료 한도가 다시 열릴 때까지 기다려 주세요.');
+    }
+    throw new Error(message);
+  }
+
+  let data = await response.json();
+  if (data.jobId) {
+    // Long transcripts may be processed asynchronously.
+    for (let i = 0; i < 45; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const poll = await fetch(
+        `https://api.supadata.ai/v1/transcript/${encodeURIComponent(data.jobId)}`,
+        { headers: { 'x-api-key': SUPADATA_API_KEY } }
+      );
+      if (!poll.ok) throw new Error(await readApiError(poll));
+      const job = await poll.json();
+      if (job.status === 'completed') {
+        data = job.result || job;
+        break;
+      }
+      if (job.status === 'failed') {
+        throw new Error(job.error || 'AI 자막 생성에 실패했어요.');
+      }
+      if (i === 44) throw new Error('자막 생성 시간이 길어지고 있어요. 잠시 후 다시 시도해 주세요.');
+    }
+  }
+
+  return data;
+}
+
+async function translateBatch(segments, batchNumber) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  const numbered = segments.map((segment, index) => ({ id: index, text: segment.en }));
+  const prompt = [
+    'Translate the following English subtitle segments into natural, concise Korean.',
+    'Keep the meaning and tone faithful. Do not add explanations or omit anything.',
+    'Return ONLY a valid JSON array. Each item must have exactly two fields: id (same integer) and ko (Korean translation).',
+    'Keep the same order and include every id exactly once.',
+    JSON.stringify(numbered)
+  ].join('\n\n');
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        responseMimeType: 'application/json'
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const message = await readApiError(response);
+    if (response.status === 429) {
+      throw new Error('Gemini 무료 사용량 또는 요청 한도에 도달했어요. 잠시 후 다시 시도해 주세요.');
+    }
+    if (response.status === 403 || response.status === 400) {
+      throw new Error('Gemini API 키 또는 무료 모델 설정을 확인해 주세요. Render의 GEMINI_API_KEY를 확인해야 해요.');
+    }
+    throw new Error(`한국어 번역 오류: ${message}`);
+  }
+
+  const data = await response.json();
+  const text = data.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('').trim();
+  if (!text) throw new Error('Gemini가 번역 결과를 반환하지 않았어요.');
+
+  let translated;
+  try {
+    translated = JSON.parse(text);
+  } catch {
+    throw new Error(`한국어 번역 결과를 읽지 못했어요. (${batchNumber}번째 묶음)`);
+  }
+  if (!Array.isArray(translated)) throw new Error('번역 결과 형식이 올바르지 않아요.');
+
+  const byId = new Map(translated.map((item) => [Number(item.id), String(item.ko || '').trim()]));
+  return segments.map((segment, index) => ({
+    ...segment,
+    ko: byId.get(index) || ''
+  }));
+}
+
+async function translateAll(segments) {
+  const batchSize = 25;
+  const output = [];
+  for (let i = 0; i < segments.length; i += batchSize) {
+    const batch = segments.slice(i, i + batchSize);
+    const translated = await translateBatch(batch, Math.floor(i / batchSize) + 1);
+    output.push(...translated);
+  }
+  return output;
+}
+
+function checkDailyLimit(ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  const entry = requestCounts.get(ip);
+  if (!entry || entry.day !== today) {
+    requestCounts.set(ip, { day: today, count: 1 });
+    return true;
+  }
+  if (entry.count >= DAILY_REQUEST_LIMIT) return false;
+  entry.count += 1;
+  return true;
+}
+
+async function handleTranscript(req, res, urlObject) {
+  if (!SUPADATA_API_KEY) {
+    return sendJson(res, 503, { error: 'Render에 SUPADATA_API_KEY가 등록되어 있지 않아요.' });
+  }
+  if (!GEMINI_API_KEY) {
+    return sendJson(res, 503, { error: 'Render에 GEMINI_API_KEY가 등록되어 있지 않아요.' });
+  }
+
+  const videoUrl = urlObject.searchParams.get('url');
+  if (!videoUrl) return sendJson(res, 400, { error: '유튜브 링크를 입력해 주세요.' });
+
+  let videoId;
+  try {
+    videoId = getYouTubeId(videoUrl);
+  } catch {
+    return sendJson(res, 400, { error: '올바른 유튜브 링크를 입력해 주세요.' });
+  }
+  if (!videoId) return sendJson(res, 400, { error: '지원되는 유튜브 링크가 아니에요.' });
+
+  const cached = transcriptCache.get(videoId);
+  if (cached && Date.now() - cached.savedAt < CACHE_TTL_MS) {
+    return sendJson(res, 200, cached.payload);
+  }
+
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+  if (!checkDailyLimit(ip)) {
+    return sendJson(res, 429, { error: '오늘 이 사이트에서 자막을 새로 불러올 수 있는 횟수(5회)를 사용했어요. 내일 다시 시도해 주세요.' });
+  }
+
+  try {
+    const transcript = await getSupadataTranscript(videoUrl);
+    const english = normalize(transcript);
+    if (!english.length) {
+      throw new Error('영어 자막을 가져오지 못했어요. 이 영상은 영어 음성 인식이 지원되지 않거나 접근이 제한됐을 수 있어요.');
+    }
+
+    const segments = await translateAll(english);
+    const payload = {
+      segments,
+      languages: {
+        english: transcript.lang || 'en',
+        korean: 'Gemini 번역'
+      },
+      warning: null
+    };
+    transcriptCache.set(videoId, { savedAt: Date.now(), payload });
+    return sendJson(res, 200, payload);
+  } catch (error) {
+    console.error('Transcript error:', error.message);
+    return sendJson(res, 502, { error: error.message || '자막을 불러오지 못했어요.' });
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
+    });
+    return res.end();
+  }
+
+  let requestUrl;
+  try {
+    requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  } catch {
+    res.writeHead(400);
+    return res.end('Bad request');
+  }
+
+  if (requestUrl.pathname === '/api/transcript' && req.method === 'GET') {
+    return handleTranscript(req, res, requestUrl);
+  }
+
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405);
+    return res.end('Method not allowed');
+  }
+
+  let pathname;
+  try {
+    pathname = decodeURIComponent(requestUrl.pathname);
+  } catch {
+    res.writeHead(400);
+    return res.end('Bad request');
+  }
+  const requested = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const full = path.resolve(ROOT, requested);
+  if (!full.startsWith(ROOT + path.sep) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
+    res.writeHead(404);
+    return res.end('Not found');
+  }
+
+  const ext = path.extname(full).toLowerCase();
+  const types = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.ico': 'image/x-icon'
+  };
+  res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
+  if (req.method === 'HEAD') return res.end();
+  fs.createReadStream(full).pipe(res);
+});
+
+server.listen(PORT, () => console.log(`mellow running on port ${PORT}`));
