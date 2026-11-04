@@ -62,7 +62,42 @@ function wordify(s){return escapeHTML(s).replace(/[A-Za-z]+(?:['’-][A-Za-z]+)*
 function stamp(s){let m=Math.floor(s/60),ss=Math.floor(s%60);return String(m).padStart(2,'0')+':'+String(ss).padStart(2,'0')}
 $('enToggle').onclick=()=>{enOn=!enOn;$('enToggle').classList.toggle('on',enOn);render()};$('koToggle').onclick=()=>{koOn=!koOn;$('koToggle').classList.toggle('on',koOn);render()};
 $('captions').onclick=e=>{let c=e.target.closest('.cap');if(c&&player?.seekTo)player.seekTo(Number(c.dataset.start),true)};
-function sync(){try{if(!player?.getCurrentTime)return;let t=player.getCurrentTime(),active=-1;rows.forEach((r,i)=>{if(t>=r.start&&t<r.end)active=i});document.querySelectorAll('.cap').forEach((el,i)=>{el.classList.toggle('active',i===active);if(i===active&&!el.dataset.seen){el.dataset.seen='1';el.scrollIntoView({block:'nearest',behavior:'smooth'})}if(i!==active)delete el.dataset.seen})}catch(e){}}
+
+function sync(){
+  try {
+    if (!player?.getCurrentTime) return;
+
+    const t = player.getCurrentTime();
+    let active = -1;
+
+    rows.forEach((r, i) => {
+      if (t >= r.start && t < r.end) active = i;
+    });
+
+    const container = $('captions');
+    const elements = container.querySelectorAll('.cap');
+
+    elements.forEach((el, i) => {
+      el.classList.toggle('active', i === active);
+
+      if (i === active) {
+        const top = el.offsetTop - container.offsetTop;
+        const bottom = top + el.offsetHeight;
+
+        if (top < container.scrollTop ||
+            bottom > container.scrollTop + container.clientHeight) {
+          container.scrollTo({
+            top: Math.max(0, top - 20),
+            behavior: 'smooth'
+          });
+        }
+      }
+    });
+  } catch(e) {
+    console.log('자막 동기화:', e);
+  }
+}
+
 setInterval(sync,500);
 function initYT(){if(!window.YT?.Player){setTimeout(initYT,500);return}let f=document.getElementById('ytplayer');if(f)player=new YT.Player('ytplayer')}
 let yt=document.createElement('script');yt.src='https://www.youtube.com/iframe_api';document.head.appendChild(yt);window.onYouTubeIframeAPIReady=initYT;
