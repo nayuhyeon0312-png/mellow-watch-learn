@@ -40,15 +40,30 @@ function getVideoId(value) {
   return null;
 }
 
+
 async function errorMessage(response) {
   const text = await response.text();
+
   try {
     const data = JSON.parse(text);
-    return data.details || data.message || data.error || text;
+
+    if (typeof data.details === 'string') return data.details;
+    if (typeof data.message === 'string') return data.message;
+
+    if (data.error && typeof data.error === 'object') {
+      return data.error.message ||
+        data.error.status ||
+        JSON.stringify(data.error);
+    }
+
+    if (typeof data.error === 'string') return data.error;
+
+    return text || `API 오류 ${response.status}`;
   } catch {
     return text || `API 오류 ${response.status}`;
   }
 }
+
 
 async function getTranscript(videoUrl) {
   const endpoint = new URL('https://api.supadata.ai/v1/transcript');
